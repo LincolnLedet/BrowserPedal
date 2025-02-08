@@ -2,47 +2,37 @@ import sounddevice as sd
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
-from numba import jit
-import keyboard  # pip install keyboard
+import keyboard
 
 # -----------------------
 #       DEVICE SETUP
 # -----------------------
-# According to your device list:
-#  - Input (AudioBox USB 96, WASAPI) = 33
-#  - Output (Headphones Realtek, WASAPI) = 27
 INPUT_DEVICE = 33
 OUTPUT_DEVICE = 27
 
-# We'll run WASAPI in exclusive mode for lower latency
 try:
     wasapi_exclusive = sd.WasapiSettings(exclusive=True)
-    print("✅ Using WASAPI exclusive mode.\n")
+    print("Using WASAPI exclusive mode.\n")
 except AttributeError:
     wasapi_exclusive = None
-    print("❌ WASAPI exclusive mode not available; falling back to default.\n")
+    print("WASAPI exclusive mode not available; using default.\n")
 
 # -----------------------
 #     AUDIO PARAMETERS
 # -----------------------
-# Matching Windows device settings is crucial:
 samplerate = 48000
-blocksize = 256  # a moderate buffer size; increase if you hear crackling
-channels = 2     # We'll capture from the left channel, then duplicate for stereo output
-
-# We'll use float32 so the effects can safely manipulate the signal
+blocksize = 512
+channels = 2
 dtype = 'float32'
 
 # -----------------------
-#  EFFECT & PLOTTING SETUP
+#  EFFECT & PLOTTING
 # -----------------------
-current_effect = "raw"  # default effect
+current_effect = "raw"
 
-# We'll plot 'blocksize' samples in real time
 fig, ax = plt.subplots()
 x = np.arange(blocksize)
-y = np.zeros(blocksize, dtype=np.float32)  # global array to store current block for plotting
-
+y = np.zeros(blocksize, dtype=np.float32)
 line, = ax.plot(x, y)
 ax.set_ylim(-1, 1)
 ax.set_xlim(0, blocksize)
@@ -50,61 +40,85 @@ ax.set_title("Live Audio Waveform")
 ax.set_xlabel("Samples")
 ax.set_ylabel("Amplitude")
 
-# Precompute a tremolo LFO for 'blocksize' frames
-# Speed = 15 Hz, depth = 0.4
-t = np.arange(blocksize) / samplerate
-lfo = 1.0 + 0.4 * np.sin(2.0 * np.pi * 15.0 * t)
+# -----------------------
+#  PARAMETERS FOR DELAY
+# -----------------------
+# Total ring buffer size (2 seconds @ 48kHz)
+delay_buffer_size = samplerate * 2
+delay_buffer = np.zeros(delay_buffer_size, dtype=np.float32)
+
+# How many samples to delay the audio
+delay_time_sec = 0.3  # 300 ms
+delay_samples = int(delay_time_sec * samplerate)
+
+# How much of the delayed signal to feed back into future repeats
+feedback = 0.5  # 0.0 = single echo, near 1.0 = many repeats
+
+# Wet mix = how much delayed signal vs. dry signal
+wet_mix = 0.5
+
+# This points to where we write new samples in the ring buffer
+write_index = 0
+
 
 # -----------------------
 #      EFFECT FUNCTIONS
 # -----------------------
-@jit(nopython=True)
 def raw_data_output(audio_block):
-    """No processing, just pass raw data."""
     return audio_block
 
-@jit(nopython=True)
 def basicDistortion(audio_block):
-    """
-    Extremely simple 'clamp' distortion:
-    Anything above +0.02 is pinned at +0.02,
-    anything below -0.02 is pinned at -0.02
-    """
     audio_block[audio_block > 0.02] = 0.02
     audio_block[audio_block < -0.02] = -0.02
     return audio_block
 
-@jit(nopython=True)
 def audioBoost(audio_block):
-    """Increase amplitude by 1.5x."""
     return audio_block * 1.5
 
-@jit(nopython=True)
-def tremolo(audio_block, lfo_block):
+def tremolo(audio_block, phase):
+    # Simple LFO-based tremolo
+    return audio_block * (1.0 + 0.4 * np.sin(phase))
+
+def delayEffect(audio_block):
     """
-    Multiply by a sinusoidal LFO (1 + 0.4*sin...).
-    This LFO array is blocksize in length.
+    Implements a ring-buffer-based delay with feedback and wet/dry mix.
     """
-    return audio_block * lfo_block
+    global write_index, delay_buffer
+
+    n = len(audio_block)
+    out_block = np.zeros_like(audio_block)
+
+    for i in range(n):
+        # Where we read from in the delay buffer
+        read_index = (write_index - delay_samples) % delay_buffer_size
+
+        # Grab the delayed sample
+        delayed_sample = delay_buffer[read_index]
+
+        # Wet/dry mix:
+        # out = dry*(1-wet) + delayed*(wet)
+        out_block[i] = (audio_block[i] * (1.0 - wet_mix)) + (delayed_sample * wet_mix)
+
+        # Write new sample + feedback into the delay buffer
+        delay_buffer[write_index] = audio_block[i] + (delayed_sample * feedback)
+
+        # Move write pointer forward
+        write_index = (write_index + 1) % delay_buffer_size
+
+    return out_block
 
 # -----------------------
 #   AUDIO CALLBACK
 # -----------------------
-def process_audio(indata, outdata, frames, time, status):
-    """
-    Called automatically by sounddevice for each audio block.
-    indata.shape = (blocksize, channels)
-    outdata.shape = (blocksize, channels)
-    """
-    global current_effect, y
+trem_phase = 0.0
+def process_audio(indata, outdata, frames, time_info, status):
+    global current_effect, y, trem_phase
 
     if status:
         print("Status:", status)
 
-    # indata[:, 0] => left channel of input (assuming your signal is here)
     mono_in = indata[:, 0]
 
-    # Apply the chosen effect
     if current_effect == "raw":
         processed = raw_data_output(mono_in)
     elif current_effect == "distortion":
@@ -112,65 +126,51 @@ def process_audio(indata, outdata, frames, time, status):
     elif current_effect == "boost":
         processed = audioBoost(mono_in)
     elif current_effect == "tremolo":
-        processed = tremolo(mono_in, lfo)  # use our precomputed LFO
+        processed = tremolo(mono_in, trem_phase)
+        trem_phase += 0.4  # increment for next block's LFO
+    elif current_effect == "delay":
+        processed = delayEffect(mono_in)
     else:
-        processed = mono_in  # default fallback
+        processed = mono_in
 
-    # Duplicate processed mono => stereo (both L & R channels)
     outdata[:, 0] = processed
     outdata[:, 1] = processed
 
-    # Update the global 'y' array for plotting
-    y[:] = processed[:blocksize]  # store the data for visualization
+    y[:] = processed[:blocksize]
 
 # -----------------------
 #  MATPLOTLIB ANIMATION
 # -----------------------
 def update_plot(frame):
-    """Updates the waveform line with the latest block data."""
     line.set_ydata(y)
     return line,
 
-ani = animation.FuncAnimation(
-    fig, update_plot, interval=20, blit=True
-)
+ani = animation.FuncAnimation(fig, update_plot, interval=20, blit=True)
 
 # -----------------------
 #  KEYBOARD HOTKEYS
 # -----------------------
 def switch_effect(effect_name):
     global current_effect
-    if effect_name in ["raw", "distortion", "boost", "tremolo"]:
+    if effect_name in ["raw", "distortion", "boost", "tremolo", "delay"]:
         current_effect = effect_name
-        print(f"🔄 Switched to effect: {effect_name}")
+        print(f"Switched to effect: {effect_name}")
     else:
-        print("❌ Invalid effect name! Choose from 'raw', 'distortion', 'boost', 'tremolo'.")
+        print("Invalid effect! Choose: raw, distortion, boost, tremolo, or delay.")
 
 keyboard.add_hotkey("1", lambda: switch_effect("raw"))
 keyboard.add_hotkey("2", lambda: switch_effect("distortion"))
 keyboard.add_hotkey("3", lambda: switch_effect("boost"))
 keyboard.add_hotkey("4", lambda: switch_effect("tremolo"))
+keyboard.add_hotkey("5", lambda: switch_effect("delay"))
 
 # -----------------------
 #       MAIN
 # -----------------------
 def main():
-    # Print device info
-    print("\n=== Available Devices ===")
-    all_devices = sd.query_devices()
-    for i, d in enumerate(all_devices):
-        print(i, d["name"], d["hostapi"], d["max_input_channels"], d["max_output_channels"])
+    print("Keys: 1=Raw, 2=Distortion, 3=Boost, 4=Tremolo, 5=Delay")
+    print("Press Ctrl+C or close the plot to stop.")
 
-    print("\n=== Host APIs ===")
-    host_apis = sd.query_hostapis()
-    for i, api in enumerate(host_apis):
-        print(i, api["name"])
-    print()
-
-    print("🎛️ Use keys: 1 = Raw, 2 = Distortion, 3 = Boost, 4 = Tremolo")
-    print("🎵 Press Ctrl+C in the console to stop (or close the plot).")
-
-    # Open a full-duplex stream using WASAPI exclusive mode
     with sd.Stream(
         device=(INPUT_DEVICE, OUTPUT_DEVICE),
         samplerate=samplerate,
@@ -179,9 +179,7 @@ def main():
         dtype=dtype,
         latency="low",
         callback=process_audio,
-        extra_settings=wasapi_exclusive
     ):
-        # Start the matplotlib animation (blocking call)
         plt.show()
 
 if __name__ == "__main__":
