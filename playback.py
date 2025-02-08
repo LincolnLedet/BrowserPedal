@@ -3,18 +3,17 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from numba import jit
-import threading
 import keyboard  # Install with `pip install keyboard`
+import math
 
-# Audio Stream Parameters
+
 samplerate = 22050
 blocksize = 512
 channels = 1
 
-# Global variable for effect selection
+
 current_effect = "raw"  # Default effect
 
-# Set up the figure and axis
 fig, ax = plt.subplots()
 x = np.linspace(0, blocksize, blocksize)
 y = np.zeros(blocksize)
@@ -34,31 +33,41 @@ def raw_data_output(audio_block):
 def basicDistortion(audio_block):
     audio_block[audio_block > .15] = .15
     audio_block[audio_block < -.15] = -.15
-    return audio_block  # Apply basic distortion
+    return audio_block 
 
 @jit(nopython=True)
 def audioBoost(audio_block):
-    return audio_block * 1.5  # Boost volume by 1.5x
+    return audio_block * 1.5
+
+
+
+def tremolo(audio_block, samplerate, depth=.4, freq=15.0):
+    t = np.arange(len(audio_block)) / samplerate  # Time vector
+    modulation = (depth * np.sin(2 * np.pi * freq * t))  # Sine LFO
+    return audio_block * modulation 
+
 
 def process_audio(indata, outdata, frames, time, status):
-    global current_effect  # Access the global variable
+    global current_effect  
 
     if status:
-        print(status)  # Handle errors
+        print(status)  
 
-    # Apply the selected effect
+    
     if current_effect == "raw":
         processed = raw_data_output(indata[:, 0])
     elif current_effect == "distortion":
         processed = basicDistortion(indata[:, 0])
     elif current_effect == "boost":
         processed = audioBoost(indata[:, 0])
+    elif current_effect == "tremolo":
+        processed = tremolo(indata[:, 0], samplerate) 
     else:
-        processed = indata[:, 0]  # Default: raw audio
+        processed = indata[:, 0] 
 
-    outdata[:, 0] = processed  # Send processed audio to output
+    outdata[:, 0] = processed  
 
-    # Update the waveform visualization
+ 
     global y
     y[:] = processed
 
@@ -69,29 +78,22 @@ def update_plot(frame):
 # Function to switch effects
 def switch_effect(effect_name):
     global current_effect
-    if effect_name in ["raw", "distortion", "boost"]:
+    if effect_name in ["raw", "distortion", "boost","tremolo"]:
         current_effect = effect_name
         print(f"🔄 Switched to effect: {effect_name}")
     else:
-        print("❌ Invalid effect name! Choose from 'raw', 'distortion', 'boost'.")
+        print("❌ Invalid effect name! Choose from 'raw', 'distortion', 'boost', 'tremolo'.")
 
-# Function to listen for key presses
-def listen_for_keys():
-    while True:
-        if keyboard.is_pressed("1"):
-            switch_effect("raw")
-        elif keyboard.is_pressed("2"):
-            switch_effect("distortion")
-        elif keyboard.is_pressed("3"):
-            switch_effect("boost")
+# ✅ Use `keyboard.add_hotkey()` instead of a separate thread
+keyboard.add_hotkey("1", lambda: switch_effect("raw"))
+keyboard.add_hotkey("2", lambda: switch_effect("distortion"))
+keyboard.add_hotkey("3", lambda: switch_effect("boost"))
+keyboard.add_hotkey("4", lambda: switch_effect("tremolo"))
 
-# Start listening for key presses in a separate thread
-threading.Thread(target=listen_for_keys, daemon=True).start()
 
-# Start the animation
 ani = animation.FuncAnimation(fig, update_plot, interval=50, blit=True)
 
 with sd.Stream(callback=process_audio, samplerate=samplerate, blocksize=blocksize, channels=channels):
     print("🎵 Processing live audio... Press Ctrl+C to stop.")
-    print("🎛️ Use keys: 1 = Raw, 2 = Distortion, 3 = Boost")
-    plt.show()
+    print("🎛️ Use keys: 1 = Raw, 2 = Distortion, 3 = Boost, 4 = tremolo")
+    plt.show()  # Start the visualization
