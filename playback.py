@@ -55,6 +55,7 @@ ax.set_title("Live Audio Waveform")
 ax.set_xlabel("Samples")
 ax.set_ylabel("Amplitude")
 
+
 # -----------------------
 #  SLIDER WIDGETS [left, bottom, width, height]
 # -----------------------
@@ -216,7 +217,8 @@ def main():
         channels=channels,
         dtype=dtype,
         latency="low",
-        callback=process_audio,
+        extra_settings=sd.WasapiSettings(exclusive=True),
+        callback=process_audio
     ):
         plt.show()
 
